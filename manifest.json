@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "TikTok Downloader",
+  "version": "0.1.0",
+  "description": "Botão de download sobre vídeos, fotos e slideshows do TikTok.",
+  "permissions": ["downloads"],
+  "content_scripts": [
+    {
+      "matches": ["https://www.tiktok.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
