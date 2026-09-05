@@ -31,9 +31,16 @@ Chrome's native download bubble, with progress and native errors.
 | Video & photo pages | Button on the player |
 | Profile grid & search | Button on every thumbnail |
 | Slideshows | Every photo, in order, in one click |
+| Profile header | **Download all videos** of the channel, with a settings panel |
 
-The file is the same MP4 TikTok's own web download serves — H.264 + AAC,
-named after the author and the item id.
+Videos are saved from the player's own stream — the same file the web player
+plays, with no watermark and at full resolution.
+
+Bulk mode walks the profile grid, then downloads everything one by one with a
+settings panel: interval between downloads, an extra long pause every 10 items
+(keeps TikTok's rate limits happy), skip files already saved, and an automatic
+retry pass over failures. Settings persist between uses, progress shows on the
+button, and clicking mid-run cancels gracefully.
 
 ## How it works
 
@@ -78,9 +85,10 @@ bun test
 
 ```
 src/
-├── content.ts      # DOM scanning, button overlay, auto-hide, hidden iframe
+├── content.ts      # DOM scanning, button overlays, settings panel, hidden iframe
+├── bulk.ts         # profile crawl: fetch capture, scroll collection, download loop
 ├── tiktok.ts       # hydration data parsing, media URL resolution
-├── background.ts   # chrome.downloads wiring
+├── background.ts   # chrome.downloads wiring + existing-file lookup
 └── messages.ts     # content ⇄ background contract
 ```
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { filesFromItem, itemIn, itemUrl, parseItemData, parseItemPage, videoUrlFrom } from "./tiktok";
+import { filesFromItem, itemIn, itemUrl, parseItemData, parseItemPage, profileIn, slimItem, videoUrlFrom } from "./tiktok";
 
 const page = (item: unknown) =>
   `<html><script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">${JSON.stringify({
@@ -78,8 +78,13 @@ describe("parseItemData", () => {
 });
 
 describe("videoUrlFrom", () => {
-  test("prefers downloadAddr over playAddr", () => {
-    expect(videoUrlFrom(videoItem())).toBe("https://cdn/download.mp4");
+  test("prefers the clean playAddr over the watermarked downloadAddr", () => {
+    expect(videoUrlFrom(videoItem())).toBe("https://cdn/play.mp4");
+  });
+
+  test("falls back to downloadAddr when playAddr is missing", () => {
+    const item = videoItem({ video: { downloadAddr: "https://cdn/download.mp4" } });
+    expect(videoUrlFrom(item)).toBe("https://cdn/download.mp4");
   });
 
   test("falls back to the highest bitrate rendition", () => {
@@ -95,7 +100,7 @@ describe("videoUrlFrom", () => {
 describe("filesFromItem", () => {
   test("returns one video file named after author and id", () => {
     expect(filesFromItem(videoItem())).toEqual([
-      { url: "https://cdn/download.mp4", filename: "tiktok_7106594312292453675.mp4" },
+      { url: "https://cdn/play.mp4", filename: "tiktok_7106594312292453675.mp4" },
     ]);
   });
 
@@ -121,5 +126,53 @@ describe("filesFromItem", () => {
 
   test("returns empty for an item without media", () => {
     expect(filesFromItem({ id: "1", author: { uniqueId: "x" } })).toEqual([]);
+  });
+});
+
+describe("profileIn", () => {
+  test("matches profile roots only", () => {
+    expect(profileIn("/@tiktok")).toBe("tiktok");
+    expect(profileIn("/@desenhos.antigos01/")).toBe("desenhos.antigos01");
+    expect(profileIn("/@tiktok/video/123")).toBeNull();
+    expect(profileIn("/@tiktok/live")).toBeNull();
+    expect(profileIn("/foryou")).toBeNull();
+  });
+});
+
+describe("slimItem", () => {
+  test("keeps the download-relevant fields of an item_list entry", () => {
+    const raw = {
+      id: "111",
+      author: { uniqueId: "user", other: "junk" },
+      video: {
+        playAddr: "https://cdn/play.mp4",
+        downloadAddr: "https://cdn/download.mp4",
+        bitrateInfo: [{ PlayAddr: { Bitrate: 1000, urlList: ["https://cdn/h.mp4"] }, extra: 1 }],
+      },
+      challenges: [],
+    };
+    const item = slimItem(raw)!;
+    expect(item.id).toBe("111");
+    expect(item.author?.uniqueId).toBe("user");
+    expect(item.video?.downloadAddr).toBe("https://cdn/download.mp4");
+    expect(item.video?.bitrateInfo?.[0]?.PlayAddr?.Bitrate).toBe(1000);
+    expect(filesFromItem(item).map((f) => f.filename)).toEqual(["user_111.mp4"]);
+  });
+
+  test("keeps slideshow images", () => {
+    const item = slimItem({
+      id: "222",
+      author: { uniqueId: "u" },
+      imagePostData: { images: [{ imageURL: { urlList: ["https://cdn/a.jpeg"] } }] },
+    })!;
+    expect(filesFromItem(item)).toEqual([
+      { url: "https://cdn/a.jpeg", filename: "u_222.jpeg" },
+    ]);
+  });
+
+  test("rejects entries without id or media", () => {
+    expect(slimItem({ id: "1", author: {} })).toBeNull();
+    expect(slimItem({ author: { uniqueId: "u" }, video: { playAddr: "x" } })).toBeNull();
+    expect(slimItem("junk")).toBeNull();
   });
 });

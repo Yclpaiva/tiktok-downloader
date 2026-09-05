@@ -1,9 +1,11 @@
 import {
-  filesFromItem, itemIn, itemUrl, parseItemData, type ItemRef, type ItemStruct, type MediaFile,
+  filesFromItem, itemIn, itemUrl, parseItemData, profileIn, type ItemRef, type ItemStruct, type MediaFile,
 } from "./tiktok";
+import { runBulk, installCapture, type Progress } from "./bulk";
 import type { DownloadRequest, DownloadResponse } from "./messages";
 
 const HOST_ATTR = "data-tkdl";
+const PROFILE_ATTR = "data-tkdl-bulk";
 const MIN_SIZE = 100;
 // Same rule as the YT extension: visible while the pointer moves, gone shortly after.
 const HIDE_DELAY_MS = 3000;
@@ -15,8 +17,9 @@ const ICONS = {
   loading: `<svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>`,
   done: `<svg viewBox="0 0 24 24"><path d="m5 12 5 5L20 7"/></svg>`,
   error: `<svg viewBox="0 0 24 24"><path d="M12 7v6"/><path d="M12 17h.01"/></svg>`,
+  all: `<svg viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5Z"/><path d="m3 13 9 5 9-5"/></svg>`,
 };
-type State = keyof typeof ICONS;
+type State = "idle" | "loading" | "done" | "error";
 
 const STYLE = `
   :host { line-height: 0; }
@@ -257,9 +260,244 @@ function mount(frame: HTMLElement, getRef: () => ItemRef | null): HTMLElement {
   return host;
 }
 
+// --- profile bulk button -----------------------------------------------------
+
+let cancelBulk: (() => void) | null = null;
+const bulkHosts = new WeakMap<Element, HTMLElement>();
+const STORAGE_KEY = "bulk";
+
+const PANEL_STYLE = `
+  .menu { position: absolute; top: 38px; right: 0; width: 300px; background: #1f1f1f;
+    border: 1px solid #3a3a3a; border-radius: 12px; padding: 12px; color: #eee;
+    font: 500 13px/1.4 system-ui, sans-serif; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+  .menu[hidden] { display: none; }
+  .label { color: #aaa; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 6px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 8px 0; }
+  .row small { color: #888; display: block; }
+  input[type=number] { width: 70px; background: #333; border: 1px solid #555; border-radius: 6px;
+    color: #fff; padding: 5px 7px; box-sizing: border-box; }
+  input[type=checkbox] { width: 16px; height: 16px; accent-color: #fe2c55; }
+  .primary { width: 100%; margin-top: 10px; background: #fe2c55; border-radius: 8px;
+    padding: 9px; text-align: center; color: #fff; cursor: pointer; font-weight: 600; }
+  .primary:hover { filter: brightness(1.1); }
+  .ghost { width: 100%; margin-top: 6px; padding: 5px; text-align: center; color: #aaa; cursor: pointer; }
+  .ghost:hover { color: #fff; }
+`;
+
+const DEFAULTS = {
+  interval: 1,
+  batchPause: 5,
+  skipExisting: true,
+  retryFailed: true,
+};
+
+type Settings = typeof DEFAULTS;
+
+async function loadSettings(): Promise<Settings> {
+  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  return { ...DEFAULTS, ...(stored?.[STORAGE_KEY] as Partial<Settings> | undefined) };
+}
+
+/**
+ * The "download all" button on profile pages, always visible next to the user
+ * name. Click opens a settings panel; starting the run closes it. Clicking the
+ * button mid-run cancels.
+ */
+function mountProfileButton() {
+  const user = profileIn(location.pathname);
+  const title = document.querySelector<HTMLElement>('[data-e2e="user-title"]');
+  if (!user || !title || bulkHosts.get(title)?.isConnected) return;
+
+  // Climb from the title to the first ancestor tall enough to hold the button.
+  let frame: HTMLElement = title.parentElement ?? title;
+  while (frame.parentElement && frame.parentElement !== document.body) {
+    const rect = frame.getBoundingClientRect();
+    if (rect.height >= 40) break;
+    frame = frame.parentElement;
+  }
+  if (getComputedStyle(frame).position === "static") frame.style.position = "relative";
+
+  const host = document.createElement("div");
+  host.setAttribute(PROFILE_ATTR, "");
+  host.style.cssText =
+    "position:absolute;top:4px;right:10px;z-index:2147483647;width:32px;height:32px;line-height:0;";
+  const root = host.attachShadow({ mode: "open" });
+  root.innerHTML = `<style>${STYLE}${PANEL_STYLE}</style><button type="button"></button><div class="menu" hidden></div>`;
+  const button = root.querySelector("button")!;
+  const menu = root.querySelector<HTMLDivElement>(".menu")!;
+
+  const setState = (state: State, tip: string, icon: State | "all" = state) => {
+    button.dataset.state = state;
+    button.title = tip;
+    button.innerHTML = ICONS[icon];
+  };
+  setState("idle", "Baixar todos os vídeos", "all");
+
+  const swallow = (event: Event) => event.stopPropagation();
+  for (const type of ["pointerdown", "mousedown", "mouseup", "touchstart", "dblclick"]) {
+    host.addEventListener(type, swallow);
+  }
+
+  const closeMenu = () => {
+    menu.hidden = true;
+    document.removeEventListener("pointerdown", onOutside, true);
+  };
+  const onOutside = (event: Event) => {
+    if (!event.composedPath().includes(host)) closeMenu();
+  };
+
+  const onProgress = (progress: Progress) => {
+    if (progress.phase === "exploring") {
+      setState("loading", `Explorando o canal… ${progress.found} vídeo(s)`);
+    } else if (progress.phase === "downloading") {
+      setState("loading", `Baixando ${progress.done}/${progress.total} · ${progress.fail} falha(s) — clique para cancelar`);
+    } else if (progress.phase === "retrying") {
+      setState("loading", `Tentando de novo ${progress.done}/${progress.total} · ${progress.fail} falha(s) — clique para cancelar`);
+    } else if (progress.cancelled) {
+      setState("done", `Cancelado — ${progress.saved} vídeo(s) salvo(s)`);
+    } else if (progress.saved === 0) {
+      setState("error", "Nenhum vídeo baixado" + (progress.fail ? ` (${progress.fail} falha(s))` : ""));
+    } else {
+      const parts = [
+        `${progress.saved} vídeo(s) salvo(s)`,
+        progress.skipped ? `${progress.skipped} já existia(m)` : "",
+        progress.fail ? `${progress.fail} falha(s)` : "",
+      ].filter(Boolean);
+      setState("done", `${parts.join(" · ")} em Downloads/TikTok`);
+    }
+  };
+
+  // --- settings panel ---
+
+  const field = <K extends keyof Settings>(key: K, label: string, hint: string) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    const text = document.createElement("label");
+    text.innerHTML = `${label}<small>${hint}</small>`;
+    row.appendChild(text);
+    return row;
+  };
+
+  async function openPanel() {
+    const settings = await loadSettings();
+    const rows = document.createElement("div");
+    rows.innerHTML = `<div class="label">Baixar todos os vídeos de @${user}</div>`;
+
+    const intervalRow = field("interval", "Intervalo entre downloads", "segundos de espera entre um vídeo e outro");
+    const interval = document.createElement("input");
+    interval.type = "number";
+    interval.min = "0";
+    interval.max = "60";
+    interval.step = "0.5";
+    interval.value = String(settings.interval);
+    intervalRow.appendChild(interval);
+
+    const batchRow = field("batchPause", "Pausa longa a cada 10", "segundos; 0 desativa — ajuda com limites do TikTok");
+    const batchPause = document.createElement("input");
+    batchPause.type = "number";
+    batchPause.min = "0";
+    batchPause.max = "600";
+    batchPause.value = String(settings.batchPause);
+    batchRow.appendChild(batchPause);
+
+    const skipRow = field("skipExisting", "Pular já baixados", "não baixa de novo o que já está na pasta");
+    const skip = document.createElement("input");
+    skip.type = "checkbox";
+    skip.checked = settings.skipExisting;
+    skipRow.appendChild(skip);
+
+    const retryRow = field("retryFailed", "Tentar de novo falhas", "uma passada extra nos vídeos que falharam");
+    const retry = document.createElement("input");
+    retry.type = "checkbox";
+    retry.checked = settings.retryFailed;
+    retryRow.appendChild(retry);
+
+    const start = document.createElement("div");
+    start.className = "primary";
+    start.textContent = "Baixar tudo";
+    const close = document.createElement("div");
+    close.className = "ghost";
+    close.textContent = "Fechar";
+    close.addEventListener("click", closeMenu);
+
+    rows.append(intervalRow, batchRow, skipRow, retryRow, start, close);
+    menu.replaceChildren(rows);
+    menu.hidden = false;
+    document.addEventListener("pointerdown", onOutside, true);
+
+    start.addEventListener("click", async () => {
+      const chosen: Settings = {
+        interval: Math.max(0, Number(interval.value) || 0),
+        batchPause: Math.max(0, Number(batchPause.value) || 0),
+        skipExisting: skip.checked,
+        retryFailed: retry.checked,
+      };
+      closeMenu();
+      await chrome.storage.local.set({ [STORAGE_KEY]: chosen });
+      startBulk(chosen);
+    });
+  }
+
+  async function startBulk(settings: Settings) {
+    const startedAt = location.pathname;
+    const onCancel = new Promise<void>((resolve) => {
+      cancelBulk = () => {
+        cancelBulk = null;
+        resolve();
+      };
+    });
+    // Leaving the profile also stops the run.
+    const navWatch = setInterval(() => {
+      if (location.pathname !== startedAt) cancelBulk?.();
+    }, 400);
+
+    let existing = new Set<string>();
+    if (settings.skipExisting) {
+      const res = (await chrome.runtime.sendMessage({ type: "bulk-existing" })) as { names?: string[] } | undefined;
+      existing = new Set(res?.names ?? []);
+    }
+
+    setState("loading", "Explorando o canal…");
+    runBulk(
+      {
+        intervalMs: settings.interval * 1000,
+        batchPauseMs: settings.batchPause * 1000,
+        skipExisting: settings.skipExisting,
+        retryFailed: settings.retryFailed,
+        existing,
+      },
+      { resolveData: itemDataFor, downloadFile: download },
+      (progress) => {
+        onProgress(progress);
+        if (progress.phase === "finished") clearInterval(navWatch);
+      },
+      onCancel,
+    ).then(() => {
+      clearInterval(navWatch);
+      cancelBulk = null;
+      setTimeout(() => setState("idle", "Baixar todos os vídeos", "all"), 4000);
+    });
+  }
+
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (cancelBulk) {
+      cancelBulk();
+      setState("loading", "Cancelando… aguarde o download em andamento terminar");
+      return;
+    }
+    menu.hidden ? openPanel() : closeMenu();
+  });
+
+  frame.appendChild(host);
+  bulkHosts.set(title, host);
+}
+
 // --- scanning ----------------------------------------------------------------
 
 function scan() {
+  mountProfileButton();
   for (const media of document.querySelectorAll<HTMLElement>("video, img")) {
     if (hosts.get(media)?.isConnected) continue;
     const rect = media.getBoundingClientRect();
@@ -284,4 +522,6 @@ new MutationObserver(schedule).observe(document.documentElement, { childList: tr
 window.addEventListener("scroll", schedule, { passive: true });
 window.addEventListener("resize", schedule);
 window.addEventListener("popstate", schedule);
+// Before the SPA's own item_list calls, so every profile batch gets captured.
+installCapture();
 schedule();

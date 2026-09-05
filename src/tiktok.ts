@@ -18,6 +18,50 @@ export function itemIn(text: string): ItemRef | null {
   return match?.[1] && match?.[2] ? { user: match[1], id: match[2] } : null;
 }
 
+/** A profile root like /@user; item pages (/@user/video/…) don't match. */
+const PROFILE_RE = /^\/@([\w.]+)\/?$/;
+
+export function profileIn(pathname: string): string | null {
+  return PROFILE_RE.exec(pathname)?.[1] ?? null;
+}
+
+/**
+ * Keeps the fields the downloader needs from an item_list payload item, in
+ * the shape `filesFromItem` already understands.
+ */
+export function slimItem(raw: unknown): ItemStruct | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, any>;
+  const video = r.video ?? {};
+  const item: ItemStruct = {
+    id: typeof r.id === "string" ? r.id : undefined,
+    author: { uniqueId: r.author?.uniqueId },
+    video: {
+      playAddr: typeof video.playAddr === "string" ? video.playAddr : undefined,
+      downloadAddr: typeof video.downloadAddr === "string" ? video.downloadAddr : undefined,
+      bitrateInfo: Array.isArray(video.bitrateInfo)
+        ? video.bitrateInfo.map((b: any) => ({
+            PlayAddr: {
+              Bitrate: b?.PlayAddr?.Bitrate,
+              urlList: Array.isArray(b?.PlayAddr?.urlList) ? b.PlayAddr.urlList : undefined,
+            },
+          }))
+        : undefined,
+    },
+    imagePostData: Array.isArray(r.imagePostData?.images)
+      ? {
+          images: r.imagePostData.images.map((i: any) => ({
+            imageURL: { urlList: Array.isArray(i?.imageURL?.urlList) ? i.imageURL.urlList : undefined },
+          })),
+        }
+      : undefined,
+  };
+  const hasMedia =
+    !!item.video?.playAddr || !!item.video?.downloadAddr || !!item.video?.bitrateInfo?.length ||
+    !!item.imagePostData?.images?.length;
+  return item.id && hasMedia ? item : null;
+}
+
 export const itemUrl = (ref: ItemRef) => `https://www.tiktok.com/@${ref.user}/video/${ref.id}`;
 
 type UrlList = { urlList?: string[] };
@@ -66,10 +110,11 @@ const extensionOf = (url: string) => {
   return /^[a-z0-9]{2,5}$/i.test(ext) ? ext : "bin";
 };
 
-/** Best video URL: TikTok's own download link, then the player's, then the highest bitrate. */
+/** Best video URL: the player's clean stream (no watermark), then TikTok's
+ * own download link, then the highest bitrate rendition. */
 export function videoUrlFrom(item: ItemStruct): string | null {
-  if (item.video?.downloadAddr) return item.video.downloadAddr;
   if (item.video?.playAddr) return item.video.playAddr;
+  if (item.video?.downloadAddr) return item.video.downloadAddr;
   const best = [...(item.video?.bitrateInfo ?? [])].sort(
     (a, b) => (b.PlayAddr?.Bitrate ?? 0) - (a.PlayAddr?.Bitrate ?? 0),
   )[0];
