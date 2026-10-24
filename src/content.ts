@@ -195,7 +195,7 @@ function mount(frame: HTMLElement, getRef: () => ItemRef | null): HTMLElement {
   const host = document.createElement("div");
   host.setAttribute(HOST_ATTR, "");
   host.style.cssText =
-    "position:absolute;top:10px;right:10px;z-index:2147483647;width:32px;height:32px;" +
+    "position:absolute;top:56px;right:10px;z-index:2147483647;width:32px;height:32px;" +
     "opacity:0;visibility:hidden;transition:opacity .2s,visibility .2s;";
   const root = host.attachShadow({ mode: "open" });
   root.innerHTML = `<style>${STYLE}</style><button type="button"></button>`;
